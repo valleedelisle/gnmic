@@ -26,8 +26,8 @@ dockers:
     ids:
       - gnmic
     image_templates:
-      - &amd64_latest_image "ghcr.io/openconfig/gnmic:latest-amd64"
-      - &amd64_versioned_image 'ghcr.io/openconfig/gnmic:{{ replace .Version "v" ""}}-amd64'
+      - &amd64_latest_image "ghcr.io/valleedelisle/gnmic:latest-amd64"
+      - &amd64_versioned_image 'ghcr.io/valleedelisle/gnmic:{{ replace .Version "v" ""}}-amd64'
     dockerfile: goreleaser-alpine.dockerfile
     skip_push: false
     use: buildx
@@ -38,8 +38,8 @@ dockers:
     ids:
       - gnmic
     image_templates:
-      - &arm64_latest_image "ghcr.io/openconfig/gnmic:latest-arm64"
-      - &arm64_versioned_image 'ghcr.io/openconfig/gnmic:{{ replace .Version "v" ""}}-arm64'
+      - &arm64_latest_image "ghcr.io/valleedelisle/gnmic:latest-arm64"
+      - &arm64_versioned_image 'ghcr.io/valleedelisle/gnmic:{{ replace .Version "v" ""}}-arm64'
     dockerfile: goreleaser-alpine.dockerfile
     skip_push: false
     use: buildx
@@ -50,16 +50,16 @@ dockers:
     ids:
       - gnmic
     image_templates:
-      - "ghcr.io/openconfig/gnmic:latest-scratch"
-      - 'ghcr.io/openconfig/gnmic:{{ replace .Version "v" ""}}-scratch'
+      - "ghcr.io/valleedelisle/gnmic:latest-scratch"
+      - 'ghcr.io/valleedelisle/gnmic:{{ replace .Version "v" ""}}-scratch'
     dockerfile: goreleaser-scratch.dockerfile
     skip_push: false
 docker_manifests:
-  - name_template: 'ghcr.io/openconfig/gnmic:{{ replace .Version "v" "" }}'
+  - name_template: 'ghcr.io/valleedelisle/gnmic:{{ replace .Version "v" "" }}'
     image_templates:
       - *amd64_versioned_image
       - *arm64_versioned_image
-  - name_template: "{{- if not .IsSnapshot}}ghcr.io/openconfig/gnmic:latest{{- end}}"
+  - name_template: "{{- if not .IsSnapshot}}ghcr.io/valleedelisle/gnmic:latest{{- end}}"
     image_templates:
       - *amd64_latest_image
       - *arm64_latest_image
