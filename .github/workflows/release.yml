@@ -12,6 +12,8 @@ on:
   push:
     tags:
       - v*
+  workflow_dispatch:
+
 env:
   GOVER: 1.23.10
   GORELEASER_VER: v1.19.2
