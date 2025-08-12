@@ -40,7 +40,7 @@ const (
 	origKeyName          = "original-key"
 	defaultClientQps     = 100
 	defaultClientBurst   = 100
-	defaultTimeout       = 10 * time.Second
+	defaultClientTimeout = 10 * time.Second
 )
 
 func init() {
