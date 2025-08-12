@@ -38,6 +38,9 @@ const (
 	loggingPrefix        = "[k8s_locker] "
 	defaultNamespace     = "default"
 	origKeyName          = "original-key"
+	defaultClientQps     = 100
+	defaultClientBurst   = 100
+	defaultTimeout       = 10 * time.Second
 )
 
 func init() {
@@ -71,6 +74,7 @@ type config struct {
 	Debug         bool          `mapstructure:"debug,omitempty" json:"debug,omitempty"`
 	QPS           float32       `mapstructure:"qps,omitempty" json:"qps,omitempty"`
 	Burst         int           `mapstructure:"burst,omitempty" json"burst,omitempty"`
+	Timeout       time.Duration `mapstructure:"timeout,omitempty" json:"timeout,omitempty"`
 }
 
 type lock struct {
@@ -95,13 +99,10 @@ func (k *k8sLocker) Init(ctx context.Context, cfg map[string]interface{}, opts .
 		return err
 	}
 
-        if k.Cfg.QPS > 0 {
-                inClusterConfig.QPS = k.Cfg.QPS
-        }
-
-        if k.Cfg.Burst > 0 {
-                inClusterConfig.Burst = k.Cfg.Burst
-        }
+	inClusterConfig.QPS = k.Cfg.QPS
+        inClusterConfig.Burst = k.Cfg.Burst
+        inClusterConfig.Timeout = k.Cfg.Timeout
+	k.logger.Printf("Setting k8s client timeout: %v QPS: %v Burst: %v", k.Cfg.Timeout, k.Cfg.QPS, k.Cfg.Burst)
 
 	k.clientset, err = kubernetes.NewForConfig(inClusterConfig)
 	if err != nil {
@@ -331,6 +332,16 @@ func (k *k8sLocker) setDefaults() error {
 	if k.Cfg.RetryTimer <= 0 {
 		k.Cfg.RetryTimer = defaultRetryTimer
 	}
+	if k.Cfg.Timeout <= 0 {
+		k.Cfg.Timeout = defaultClientTimeout
+	}
+	if k.Cfg.QPS <= 0 {
+		k.Cfg.QPS = defaultClientQps
+	}
+	if k.Cfg.Burst <= 0 {
+		k.Cfg.Burst = defaultClientBurst
+	}
+
 	return nil
 }
 
