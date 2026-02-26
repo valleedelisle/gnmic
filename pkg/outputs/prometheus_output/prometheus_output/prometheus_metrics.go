@@ -37,26 +37,33 @@ var prometheusNumberOfCachedMetrics = prometheus.NewGaugeVec(
 		Help:      "Number of metrics cached by the prometheus output",
 	}, []string{"name"})
 
-func (p *prometheusOutput) initMetrics() {
-	if p.cfg.CacheConfig == nil {
-		prometheusNumberOfMetrics.WithLabelValues(p.cfg.Name).Set(0)
+func (p *prometheusOutput) initMetrics(cfg *config) {
+	if cfg.CacheConfig == nil {
+		prometheusNumberOfMetrics.WithLabelValues(cfg.Name).Set(0)
 		return
 	}
-	prometheusNumberOfCachedMetrics.WithLabelValues(p.cfg.Name).Set(0)
+	prometheusNumberOfCachedMetrics.WithLabelValues(cfg.Name).Set(0)
 }
 
 func (p *prometheusOutput) registerMetrics() error {
+	cfg := p.cfg.Load()
+	if cfg == nil {
+		return nil
+	}
+	if !cfg.EnableMetrics {
+		return nil
+	}
 	if p.reg == nil {
 		return nil
 	}
 	var err error
 	registerMetricsOnce.Do(func() {
-		if p.cfg.CacheConfig == nil {
+		if cfg.CacheConfig == nil {
 			err = p.reg.Register(prometheusNumberOfMetrics)
 			return
 		}
 		err = p.reg.Register(prometheusNumberOfCachedMetrics)
 	})
-	p.initMetrics()
+	p.initMetrics(cfg)
 	return err
 }

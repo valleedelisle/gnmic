@@ -44,15 +44,23 @@ var kafkaSendDuration = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Help:      "gnmic kafka output send duration in ns",
 }, []string{"name", "producer_id"})
 
-func (k *kafkaOutput) initMetrics() {
-	kafkaNumberOfSentMsgs.WithLabelValues(k.cfg.Name, "").Add(0)
-	kafkaNumberOfSentBytes.WithLabelValues(k.cfg.Name, "").Add(0)
-	kafkaNumberOfFailSendMsgs.WithLabelValues(k.cfg.Name, "", "").Add(0)
-	kafkaSendDuration.WithLabelValues(k.cfg.Name, "").Set(0)
+func (k *kafkaOutput) initMetrics(name string) {
+	kafkaNumberOfSentMsgs.WithLabelValues(name, "").Add(0)
+	kafkaNumberOfSentBytes.WithLabelValues(name, "").Add(0)
+	kafkaNumberOfFailSendMsgs.WithLabelValues(name, "", "").Add(0)
+	kafkaSendDuration.WithLabelValues(name, "").Set(0)
 }
 
 func (k *kafkaOutput) registerMetrics() error {
+	cfg := k.cfg.Load()
+	if cfg == nil {
+		return nil
+	}
+	if !cfg.EnableMetrics {
+		return nil
+	}
 	if k.reg == nil {
+		k.logger.Printf("ERR: metrics enabled but main registry is not initialized, enable main metrics under `api-server`")
 		return nil
 	}
 	var err error
@@ -70,6 +78,6 @@ func (k *kafkaOutput) registerMetrics() error {
 			return
 		}
 	})
-	k.initMetrics()
+	k.initMetrics(cfg.Name)
 	return err
 }

@@ -11,52 +11,51 @@ package outputs
 import (
 	"log"
 
-	"github.com/openconfig/gnmic/pkg/api/types"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/zestor-dev/zestor/store"
 )
 
-type Option func(Output) error
+type OutputOptions struct {
+	Name        string
+	ClusterName string
+	Logger      *log.Logger
+	Registry    *prometheus.Registry
+	Store       store.Store[any]
+}
+
+type Option func(*OutputOptions) error
 
 func WithLogger(logger *log.Logger) Option {
-	return func(o Output) error {
-		o.SetLogger(logger)
+	return func(o *OutputOptions) error {
+		o.Logger = logger
 		return nil
 	}
 }
 
-func WithEventProcessors(eps map[string]map[string]interface{},
-	log *log.Logger,
-	tcs map[string]*types.TargetConfig,
-	acts map[string]map[string]interface{}) Option {
-	return func(o Output) error {
-		return o.SetEventProcessors(eps, log, tcs, acts)
-	}
-}
-
 func WithRegistry(reg *prometheus.Registry) Option {
-	return func(o Output) error {
-		o.RegisterMetrics(reg)
+	return func(o *OutputOptions) error {
+		o.Registry = reg
 		return nil
 	}
 }
 
 func WithName(name string) Option {
-	return func(o Output) error {
-		o.SetName(name)
+	return func(o *OutputOptions) error {
+		o.Name = name
 		return nil
 	}
 }
 
 func WithClusterName(name string) Option {
-	return func(o Output) error {
-		o.SetClusterName(name)
+	return func(o *OutputOptions) error {
+		o.ClusterName = name
 		return nil
 	}
 }
 
-func WithTargetsConfig(tcs map[string]*types.TargetConfig) Option {
-	return func(o Output) error {
-		o.SetTargetsConfig(tcs)
+func WithConfigStore(st store.Store[any]) Option {
+	return func(o *OutputOptions) error {
+		o.Store = st
 		return nil
 	}
 }

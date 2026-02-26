@@ -32,7 +32,7 @@ const (
 	defaultMaxServiceFail             = 3
 )
 
-type gnmiServer struct {
+type GNMIServer struct {
 	Address               string               `mapstructure:"address,omitempty" json:"address,omitempty"`
 	MinSampleInterval     time.Duration        `mapstructure:"min-sample-interval,omitempty" json:"min-sample-interval,omitempty"`
 	DefaultSampleInterval time.Duration        `mapstructure:"default-sample-interval,omitempty" json:"default-sample-interval,omitempty"`
@@ -45,6 +45,7 @@ type gnmiServer struct {
 	TCPKeepalive          time.Duration        `mapstructure:"tcp-keepalive,omitempty" json:"tcp-keepalive,omitempty"`
 	GRPCKeepalive         *grpcKeepaliveConfig `mapstructure:"grpc-keepalive,omitempty" json:"grpc-keepalive,omitempty"`
 	RateLimit             int64                `mapstructure:"rate-limit,omitempty" json:"rate-limit,omitempty"`
+	Timeout               time.Duration        `mapstructure:"timeout,omitempty" json:"timeout,omitempty"`
 	TLS                   *types.TLSConfig     `mapstructure:"tls,omitempty" json:"tls,omitempty"`
 	EnableMetrics         bool                 `mapstructure:"enable-metrics,omitempty" json:"enable-metrics,omitempty"`
 	Debug                 bool                 `mapstructure:"debug,omitempty" json:"debug,omitempty"`
@@ -110,7 +111,7 @@ func (c *Config) GetGNMIServer() error {
 	if !c.FileConfig.IsSet("gnmi-server") {
 		return nil
 	}
-	c.GnmiServer = new(gnmiServer)
+	c.GnmiServer = new(GNMIServer)
 	c.GnmiServer.Address = os.ExpandEnv(c.FileConfig.GetString("gnmi-server/address"))
 
 	maxSubVal := os.ExpandEnv(c.FileConfig.GetString("gnmi-server/max-subscriptions"))
@@ -142,6 +143,8 @@ func (c *Config) GetGNMIServer() error {
 
 	c.GnmiServer.EnableMetrics = os.ExpandEnv(c.FileConfig.GetString("gnmi-server/enable-metrics")) == trueString
 	c.GnmiServer.Debug = os.ExpandEnv(c.FileConfig.GetString("gnmi-server/debug")) == trueString
+	c.GnmiServer.Timeout = c.FileConfig.GetDuration("gnmi-server/timeout")
+
 	c.setGnmiServerDefaults()
 
 	if c.FileConfig.IsSet("gnmi-server/service-registration") {

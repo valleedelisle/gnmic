@@ -44,15 +44,23 @@ var numberOfFailWriteMsgs = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Help:      "Number of failed message writes to file output",
 }, []string{"name", "file_name", "reason"})
 
-func (f *File) initMetrics() {
-	numberOfWrittenBytes.WithLabelValues(f.cfg.Name, "").Add(0)
-	numberOfReceivedMsgs.WithLabelValues(f.cfg.Name, "").Add(0)
-	numberOfWrittenMsgs.WithLabelValues(f.cfg.Name, "").Add(0)
-	numberOfFailWriteMsgs.WithLabelValues(f.cfg.Name, "", "").Add(0)
+func (f *File) initMetrics(name string) {
+	numberOfWrittenBytes.WithLabelValues(name, "").Add(0)
+	numberOfReceivedMsgs.WithLabelValues(name, "").Add(0)
+	numberOfWrittenMsgs.WithLabelValues(name, "").Add(0)
+	numberOfFailWriteMsgs.WithLabelValues(name, "", "").Add(0)
 }
 
 func (f *File) registerMetrics() error {
+	cfg := f.cfg.Load()
+	if cfg == nil {
+		return nil
+	}
+	if !cfg.EnableMetrics {
+		return nil
+	}
 	if f.reg == nil {
+		f.logger.Printf("ERR: metrics enabled but main registry is not initialized, enable main metrics under `api-server`")
 		return nil
 	}
 	var err error
@@ -70,6 +78,6 @@ func (f *File) registerMetrics() error {
 			return
 		}
 	})
-	f.initMetrics()
+	f.initMetrics(cfg.Name)
 	return err
 }

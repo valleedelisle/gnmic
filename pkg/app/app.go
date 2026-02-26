@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"sort"
@@ -47,6 +48,10 @@ import (
 	"github.com/openconfig/gnmic/pkg/inputs"
 	"github.com/openconfig/gnmic/pkg/lockers"
 	"github.com/openconfig/gnmic/pkg/outputs"
+	"github.com/openconfig/gnmic/pkg/utils"
+	"github.com/openconfig/gnmic/pkg/version"
+	"github.com/zestor-dev/zestor/store"
+	"github.com/zestor-dev/zestor/store/gomap"
 )
 
 const (
@@ -66,6 +71,7 @@ type App struct {
 	//
 	configLock *sync.RWMutex
 	Config     *config.Config
+	Store      store.Store[any]
 	// collector
 	dialOpts      []grpc.DialOption
 	operLock      *sync.RWMutex
@@ -111,6 +117,9 @@ type App struct {
 	tunTargetCfn  map[tunnel.Target]context.CancelFunc
 	// processors plugin manager
 	pm *plugin_manager.PluginManager
+
+	// pprof
+	pprof *pprofServer
 }
 
 func New() *App {
@@ -121,6 +130,7 @@ func New() *App {
 		RootCmd:    new(cobra.Command),
 		sem:        semaphore.NewWeighted(1),
 		configLock: new(sync.RWMutex),
+		Store:      gomap.NewMemStore(store.StoreOptions[any]{}),
 		Config:     config.New(),
 		reg:        prometheus.NewRegistry(),
 		//
@@ -149,6 +159,9 @@ func New() *App {
 		ttm:          new(sync.RWMutex),
 		tunTargets:   make(map[tunnel.Target]struct{}),
 		tunTargetCfn: make(map[tunnel.Target]context.CancelFunc),
+
+		// pprof
+		pprof: newPprofServer(),
 	}
 	a.router.StrictSlash(true)
 	a.router.Use(headersMiddleware, a.loggingMiddleware)
@@ -177,6 +190,8 @@ func (a *App) InitGlobalFlags() {
 	a.RootCmd.PersistentFlags().StringVarP(&a.Config.GlobalFlags.TLSKey, "tls-key", "", "", "tls key")
 	a.RootCmd.PersistentFlags().DurationVarP(&a.Config.GlobalFlags.Timeout, "timeout", "", 10*time.Second, "grpc timeout, valid formats: 10s, 1m30s, 1h")
 	a.RootCmd.PersistentFlags().BoolVarP(&a.Config.GlobalFlags.Debug, "debug", "d", false, "debug mode")
+	a.RootCmd.PersistentFlags().BoolVarP(&a.Config.GlobalFlags.EnablePprof, "enable-pprof", "", false, "enable go pprof")
+	a.RootCmd.PersistentFlags().StringVarP(&a.Config.GlobalFlags.PprofAddr, "pprof-addr", "", defaultPprofAddr, "pprof host/IP and port to listen on")
 	a.RootCmd.PersistentFlags().BoolVarP(&a.Config.GlobalFlags.SkipVerify, "skip-verify", "", false, "skip verify tls connection")
 	a.RootCmd.PersistentFlags().BoolVarP(&a.Config.GlobalFlags.NoPrefix, "no-prefix", "", false, "do not add [ip:port] prefix to print output in case of multiple targets")
 	a.RootCmd.PersistentFlags().BoolVarP(&a.Config.GlobalFlags.ProxyFromEnv, "proxy-from-env", "", false, "use proxy from environment")
@@ -199,6 +214,8 @@ func (a *App) InitGlobalFlags() {
 	a.RootCmd.PersistentFlags().StringVarP(&a.Config.GlobalFlags.API, "api", "", "", "gnmic api address")
 	a.RootCmd.PersistentFlags().StringArrayVarP(&a.Config.GlobalFlags.ProtoFile, "proto-file", "", nil, "proto file(s) name(s)")
 	a.RootCmd.PersistentFlags().StringArrayVarP(&a.Config.GlobalFlags.ProtoDir, "proto-dir", "", nil, "directory to look for proto files specified with --proto-file")
+	a.RootCmd.PersistentFlags().StringArrayVarP(&a.Config.GlobalFlags.RegisteredExtensions, "registered-extensions", "", nil, "registered (custom) extensions")
+	a.RootCmd.PersistentFlags().StringVarP(&a.Config.GlobalFlags.RequestExtensions, "request-extensions", "", "", "add registered (custom) extensions to request")
 	a.RootCmd.PersistentFlags().StringVarP(&a.Config.GlobalFlags.TargetsFile, "targets-file", "", "", "path to file with targets configuration")
 	a.RootCmd.PersistentFlags().BoolVarP(&a.Config.GlobalFlags.Gzip, "gzip", "", false, "enable gzip compression on gRPC connections")
 	a.RootCmd.PersistentFlags().StringVarP(&a.Config.GlobalFlags.Token, "token", "", "", "token value, used for gRPC token based authentication")
@@ -218,6 +235,26 @@ func (a *App) InitGlobalFlags() {
 }
 
 func (a *App) PreRunE(cmd *cobra.Command, args []string) error {
+	err := a.Config.ToStore(a.Store)
+	if err != nil {
+		return err
+	}
+	if a.Config.Debug {
+		fmt.Println(a.Store.Dump())
+	}
+	if a.Config.EnablePprof {
+		_, _, err := net.SplitHostPort(a.Config.GlobalFlags.PprofAddr)
+		if err != nil {
+			return fmt.Errorf("pprof error %v", err)
+		}
+		a.pprof.Start(a.Config.GlobalFlags.PprofAddr)
+		a.Logger.Printf("pprof server started at %s/debug/pprof", a.Config.GlobalFlags.PprofAddr)
+		go func() {
+			err := <-a.pprof.ErrChan()
+			a.Logger.Printf("pprof server failed: %v", err)
+		}()
+	}
+
 	a.Config.SetGlobalsFromEnv(a.RootCmd)
 	a.Config.SetPersistentFlagsFromFile(a.RootCmd)
 
@@ -228,7 +265,7 @@ func (a *App) PreRunE(cmd *cobra.Command, args []string) error {
 	a.Logger.SetOutput(logOutput)
 	a.Logger.SetFlags(flags)
 	a.Config.Address = config.ParseAddressField(a.Config.Address)
-	a.Logger.Printf("version=%s, commit=%s, date=%s, gitURL=%s, docs=https://gnmic.openconfig.net", version, commit, date, gitURL)
+	a.Logger.Printf("version=%s, commit=%s, date=%s, gitURL=%s, docs=https://gnmic.openconfig.net", version.Version, version.Commit, version.Date, version.GitURL)
 
 	if a.Config.Debug {
 		grpclog.SetLogger(a.Logger) //lint:ignore SA1019 see https://github.com/karimra/gnmic/issues/59
@@ -304,12 +341,22 @@ func (a *App) PrintMsg(address string, msgName string, msg proto.Message) error 
 			return nil
 		}
 	}
+
+	registeredExtensions, err := utils.ParseRegisteredExtensions(a.Config.RegisteredExtensions)
+
+	if err != nil {
+		return err
+	}
+
 	mo := formatters.MarshalOptions{
-		Multiline:        true,
-		Indent:           "  ",
-		Format:           a.Config.Format,
-		ValuesOnly:       a.Config.GetValuesOnly,
-		CalculateLatency: a.Config.CalculateLatency,
+		Multiline:            true,
+		Indent:               "  ",
+		Format:               a.Config.Format,
+		ValuesOnly:           a.Config.GetValuesOnly,
+		CalculateLatency:     a.Config.CalculateLatency,
+		ProtoFiles:           a.Config.ProtoFile,
+		ProtoDir:             a.Config.ProtoDir,
+		RegisteredExtensions: registeredExtensions,
 	}
 	b, err := mo.Marshal(msg, map[string]string{"source": address})
 	if err != nil {
@@ -327,7 +374,7 @@ func (a *App) PrintMsg(address string, msgName string, msg proto.Message) error 
 
 func (a *App) createCollectorDialOpts() {
 	// append gRPC userAgent name
-	opts := []grpc.DialOption{grpc.WithUserAgent(fmt.Sprintf("gNMIc/%s", version))}
+	opts := []grpc.DialOption{grpc.WithUserAgent(fmt.Sprintf("gNMIc/%s", version.Version))}
 	// add maxMsgSize
 	if a.Config.MaxMsgSize > 0 {
 		opts = append(opts, grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(a.Config.MaxMsgSize)))

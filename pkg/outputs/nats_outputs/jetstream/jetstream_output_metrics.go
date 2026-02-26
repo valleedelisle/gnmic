@@ -45,14 +45,26 @@ var jetStreamSendDuration = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 }, []string{"publisher_id"})
 
 func (n *jetstreamOutput) initMetrics() {
-	jetStreamNumberOfSentMsgs.WithLabelValues(n.Cfg.Name, "").Add(0)
-	jetStreamNumberOfSentBytes.WithLabelValues(n.Cfg.Name, "").Add(0)
-	jetStreamNumberOfFailSendMsgs.WithLabelValues(n.Cfg.Name, "").Add(0)
-	jetStreamSendDuration.WithLabelValues(n.Cfg.Name).Set(0)
+	currCfg := n.cfg.Load()
+	if currCfg == nil {
+		return
+	}
+	jetStreamNumberOfSentMsgs.WithLabelValues(currCfg.Name, "").Add(0)
+	jetStreamNumberOfSentBytes.WithLabelValues(currCfg.Name, "").Add(0)
+	jetStreamNumberOfFailSendMsgs.WithLabelValues(currCfg.Name, "").Add(0)
+	jetStreamSendDuration.WithLabelValues(currCfg.Name).Set(0)
 }
 
 func (n *jetstreamOutput) registerMetrics() error {
+	currCfg := n.cfg.Load()
+	if currCfg == nil {
+		return nil
+	}
+	if !currCfg.EnableMetrics {
+		return nil
+	}
 	if n.reg == nil {
+		n.logger.Printf("ERR: metrics enabled but main registry is not initialized, enable main metrics under `api-server`")
 		return nil
 	}
 

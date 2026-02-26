@@ -15,8 +15,10 @@ import (
 	"io"
 	"log"
 	"net"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/protobuf/proto"
@@ -30,6 +32,9 @@ import (
 	"github.com/openconfig/gnmic/pkg/formatters"
 	"github.com/openconfig/gnmic/pkg/inputs"
 	"github.com/openconfig/gnmic/pkg/outputs"
+	"github.com/openconfig/gnmic/pkg/pipeline"
+	pkgutils "github.com/openconfig/gnmic/pkg/utils"
+	"github.com/zestor-dev/zestor/store"
 )
 
 const (
@@ -41,6 +46,7 @@ const (
 	defaultNumWorkers       = 1
 	defaultBufferSize       = 500
 	defaultFetchBatchSize   = 500
+	defaultMaxAckPending    = 1000
 )
 
 type deliverPolicy string
@@ -54,13 +60,13 @@ const (
 
 func toJSDeliverPolicy(dp deliverPolicy) jetstream.DeliverPolicy {
 	switch dp {
-	case "all":
+	case deliverPolicyAll:
 		return jetstream.DeliverAllPolicy
-	case "last":
+	case deliverPolicyLast:
 		return jetstream.DeliverLastPolicy
-	case "new":
+	case deliverPolicyNew:
 		return jetstream.DeliverNewPolicy
-	case "last-per-subject":
+	case deliverPolicyLastPerSubject:
 		return jetstream.DeliverLastPerSubjectPolicy
 	}
 	return 0
@@ -68,24 +74,39 @@ func toJSDeliverPolicy(dp deliverPolicy) jetstream.DeliverPolicy {
 
 func init() {
 	inputs.Register("jetstream", func() inputs.Input {
-		return &JetstreamInput{
-			Cfg:    &Config{},
-			logger: log.New(io.Discard, loggingPrefix, utils.DefaultLoggingFlags),
-			wg:     new(sync.WaitGroup),
+		return &jetstreamInput{
+			confLock: new(sync.RWMutex),
+			cfg:      new(atomic.Pointer[config]),
+			dynCfg:   new(atomic.Pointer[dynConfig]),
+			logger:   log.New(io.Discard, loggingPrefix, utils.DefaultLoggingFlags),
+			wg:       new(sync.WaitGroup),
 		}
 	})
 }
 
-// JetstreamInput //
-type JetstreamInput struct {
-	Cfg    *Config
+// jetstreamInput //
+type jetstreamInput struct {
+	// ensure only one Update or UpdateProcessor operation
+	// are performed at a time
+	confLock *sync.RWMutex
+
+	inputs.BaseInput
+	cfg    *atomic.Pointer[config]
+	dynCfg *atomic.Pointer[dynConfig]
+
 	ctx    context.Context
 	cfn    context.CancelFunc
 	logger *log.Logger
 
-	wg      *sync.WaitGroup
-	outputs []outputs.Output
-	evps    []formatters.EventProcessor
+	wg       *sync.WaitGroup
+	outputs  []outputs.Output // used when the cmd is subscribe
+	store    store.Store[any]
+	pipeline chan *pipeline.Msg
+}
+
+type dynConfig struct {
+	evps       []formatters.EventProcessor
+	outputsMap map[string]struct{} // used when the cmd is collector
 }
 
 type subjectFormat string
@@ -96,8 +117,8 @@ const (
 	subjectFormat_SubTarget = "subscription.target"
 )
 
-// Config //
-type Config struct {
+// config //
+type config struct {
 	Name            string           `mapstructure:"name,omitempty"`
 	Address         string           `mapstructure:"address,omitempty"`
 	Stream          string           `mapstructure:"stream,omitempty"`
@@ -113,39 +134,197 @@ type Config struct {
 	NumWorkers      int              `mapstructure:"num-workers,omitempty"`
 	BufferSize      int              `mapstructure:"buffer-size,omitempty"`
 	FetchBatchSize  int              `mapstructure:"fetch-batch-size,omitempty"`
+	MaxAckPending   *int             `mapstructure:"max-ack-pending,omitempty"`
 	Outputs         []string         `mapstructure:"outputs,omitempty"`
 	EventProcessors []string         `mapstructure:"event-processors,omitempty"`
 }
 
 // Init //
-func (n *JetstreamInput) Start(ctx context.Context, name string, cfg map[string]interface{}, opts ...inputs.Option) error {
-	err := outputs.DecodeConfig(cfg, n.Cfg)
+func (n *jetstreamInput) Start(ctx context.Context, name string, cfg map[string]any, opts ...inputs.Option) error {
+	n.confLock.Lock()
+	defer n.confLock.Unlock()
+
+	newCfg := new(config)
+	err := outputs.DecodeConfig(cfg, newCfg)
 	if err != nil {
 		return err
 	}
-	if n.Cfg.Name == "" {
-		n.Cfg.Name = name
+	if newCfg.Name == "" {
+		newCfg.Name = name
 	}
-	n.logger.SetPrefix(fmt.Sprintf(loggingPrefix, n.Cfg.Name))
+	n.logger.SetPrefix(fmt.Sprintf(loggingPrefix, newCfg.Name))
+	options := &inputs.InputOptions{}
 	for _, opt := range opts {
-		if err := opt(n); err != nil {
+		if err := opt(options); err != nil {
 			return err
 		}
 	}
-	err = n.setDefaults()
+	n.store = options.Store
+	n.pipeline = options.Pipeline
+
+	n.setName(options.Name, newCfg)
+	n.setLogger(options.Logger)
+	outputs, outputsMap := n.getOutputs(options.Outputs, newCfg)
+	n.outputs = outputs
+	evps, err := n.buildEventProcessors(options.Logger, newCfg.EventProcessors)
 	if err != nil {
 		return err
 	}
-	n.ctx, n.cfn = context.WithCancel(ctx)
-	n.logger.Printf("input starting with config: %+v", n.Cfg)
-	n.wg.Add(n.Cfg.NumWorkers)
-	for i := 0; i < n.Cfg.NumWorkers; i++ {
-		go n.worker(ctx, i)
+	err = n.setDefaultsFor(newCfg)
+	if err != nil {
+		return err
+	}
+
+	n.cfg.Store(newCfg)
+
+	dc := &dynConfig{
+		evps:       evps,
+		outputsMap: outputsMap,
+	}
+
+	n.dynCfg.Store(dc)
+	n.ctx = ctx                // save context for worker restarts
+	var runCtx context.Context // create a run context for the workers
+	runCtx, n.cfn = context.WithCancel(ctx)
+	n.logger.Printf("input starting with config: %+v", newCfg)
+	n.wg.Add(newCfg.NumWorkers)
+	for i := 0; i < newCfg.NumWorkers; i++ {
+		go n.worker(runCtx, i)
 	}
 	return nil
 }
 
-func (n *JetstreamInput) worker(ctx context.Context, idx int) {
+func (n *jetstreamInput) Validate(cfg map[string]any) error {
+	newCfg := new(config)
+	err := outputs.DecodeConfig(cfg, newCfg)
+	if err != nil {
+		return err
+	}
+	return n.setDefaultsFor(newCfg)
+}
+
+// Update updates the input configuration and restarts the workers if
+// necessary.
+// It works only when the command is collector (not subscribe).
+func (n *jetstreamInput) Update(cfg map[string]any) error {
+	n.confLock.Lock()
+	defer n.confLock.Unlock()
+
+	newCfg := new(config)
+	err := outputs.DecodeConfig(cfg, newCfg)
+	if err != nil {
+		return err
+	}
+	n.setDefaultsFor(newCfg)
+	currCfg := n.cfg.Load()
+
+	restartWorkers := needsWorkerRestart(currCfg, newCfg)
+	rebuildProcessors := slices.Compare(currCfg.EventProcessors, newCfg.EventProcessors) != 0
+	// build new dynamic config
+	dc := &dynConfig{
+		outputsMap: make(map[string]struct{}),
+	}
+	for _, o := range newCfg.Outputs {
+		dc.outputsMap[o] = struct{}{}
+	}
+
+	prevDC := n.dynCfg.Load()
+
+	if rebuildProcessors {
+		dc.evps, err = n.buildEventProcessors(n.logger, newCfg.EventProcessors)
+		if err != nil {
+			return err
+		}
+	} else if prevDC != nil {
+		dc.evps = prevDC.evps
+	}
+
+	n.dynCfg.Store(dc)
+	n.cfg.Store(newCfg)
+
+	if restartWorkers {
+		runCtx, cancel := context.WithCancel(n.ctx)
+		newWG := new(sync.WaitGroup)
+		// save old pointers
+		oldCancel := n.cfn
+		oldWG := n.wg
+		// swap
+		n.cfn = cancel
+		n.wg = newWG
+
+		n.wg.Add(newCfg.NumWorkers)
+		for i := 0; i < newCfg.NumWorkers; i++ {
+			go n.worker(runCtx, i)
+		}
+		// cancel old workers and loops
+		if oldCancel != nil {
+			oldCancel()
+		}
+		if oldWG != nil {
+			oldWG.Wait()
+		}
+	}
+	return nil
+}
+
+func (n *jetstreamInput) UpdateProcessor(name string, pcfg map[string]any) error {
+	n.confLock.Lock()
+	defer n.confLock.Unlock()
+
+	cfg := n.cfg.Load()
+	dc := n.dynCfg.Load()
+
+	newEvps, changed, err := inputs.UpdateProcessorInSlice(
+		n.logger,
+		n.store,
+		cfg.EventProcessors,
+		dc.evps,
+		name,
+		pcfg,
+	)
+	if err != nil {
+		return err
+	}
+	if changed {
+		newDC := *dc
+		newDC.evps = newEvps
+		n.dynCfg.Store(&newDC)
+		n.logger.Printf("updated event processor %s", name)
+	}
+	return nil
+}
+
+func needsWorkerRestart(old, nw *config) bool {
+	if old == nil || nw == nil {
+		return true
+	}
+	return old.NumWorkers != nw.NumWorkers ||
+		old.BufferSize != nw.BufferSize ||
+		old.FetchBatchSize != nw.FetchBatchSize ||
+		old.Address != nw.Address ||
+		old.Stream != nw.Stream ||
+		slices.Compare(old.Subjects, nw.Subjects) != 0 ||
+		old.DeliverPolicy != nw.DeliverPolicy ||
+		old.Username != nw.Username ||
+		old.Password != nw.Password ||
+		!old.TLS.Equal(nw.TLS) ||
+		old.ConnectTimeWait != nw.ConnectTimeWait ||
+		!maxAckPendingEqual(old.MaxAckPending, nw.MaxAckPending)
+}
+
+func maxAckPendingEqual(a, b *int) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	return *a == *b
+}
+
+func (n *jetstreamInput) worker(ctx context.Context, idx int) {
+	defer n.wg.Done()
+
 	workerLogPrefix := fmt.Sprintf("worker-%d", idx)
 	n.logger.Printf("%s starting", workerLogPrefix)
 
@@ -154,42 +333,77 @@ func (n *JetstreamInput) worker(ctx context.Context, idx int) {
 		case <-ctx.Done():
 			return
 		default:
-			err := n.workerStart(ctx)
-			if err != nil {
-				n.logger.Printf("%s %v", workerLogPrefix, err)
-				time.Sleep(n.Cfg.ConnectTimeWait)
-			}
+		}
+		n.logger.Printf("worker %d loading config", idx)
+		cfg := n.cfg.Load()
+		wCfg := *cfg
+		wCfg.Name = fmt.Sprintf("%s-%d", wCfg.Name, idx)
+		// scoped connection, subscription and cleanup
+		err := n.doWork(ctx, &wCfg, workerLogPrefix)
+		if err != nil {
+			n.logger.Printf("%s JetStream client failed: %v", workerLogPrefix, err)
+		}
+
+		// backoff before retry
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(wCfg.ConnectTimeWait):
 		}
 	}
 }
 
-func (n *JetstreamInput) workerStart(ctx context.Context) error {
-	nc, err := n.createNATSConn(n.Cfg)
+// scoped connection, subscription and cleanup
+func (n *jetstreamInput) doWork(ctx context.Context, wCfg *config, workerLogPrefix string) error {
+	nc, err := n.createNATSConn(wCfg)
 	if err != nil {
-		return fmt.Errorf("failed to create NATS connection: %v", err)
+		return fmt.Errorf("create NATS connection: %w", err)
 	}
 	defer nc.Close()
 
 	js, err := jetstream.New(nc)
 	if err != nil {
-		return fmt.Errorf("failed to create JetStream context: %v", err)
+		return fmt.Errorf("create JetStream context: %w", err)
 	}
 
-	s, err := js.Stream(ctx, n.Cfg.Stream)
+	s, err := js.Stream(ctx, wCfg.Stream)
 	if err != nil {
-		return fmt.Errorf("failed to get stream: %v", err)
+		return fmt.Errorf("get stream: %w", err)
+	}
+
+	// Get stream info to determine retention policy
+	streamInfo, err := s.Info(ctx)
+	if err != nil {
+		return fmt.Errorf("get stream info: %w", err)
+	}
+
+	// Determine ack policy and deliver policy based on stream retention
+	// Workqueue streams have specific requirements
+	ackPolicy := jetstream.AckAllPolicy
+	deliverPolicy := toJSDeliverPolicy(wCfg.DeliverPolicy)
+
+	if streamInfo.Config.Retention == jetstream.WorkQueuePolicy {
+		// Workqueue streams require explicit ack
+		ackPolicy = jetstream.AckExplicitPolicy
+		// Workqueue streams allow DeliverAllPolicy or DeliverNewPolicy
+		// Use configured policy, but only if it's one of these two
+		if deliverPolicy != jetstream.DeliverAllPolicy && deliverPolicy != jetstream.DeliverNewPolicy {
+			// Default to DeliverAllPolicy for workqueue if configured policy is not compatible
+			deliverPolicy = jetstream.DeliverAllPolicy
+		}
 	}
 
 	c, err := s.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
-		Name:           n.Cfg.Name,
-		Durable:        n.Cfg.Name,
-		DeliverPolicy:  toJSDeliverPolicy(n.Cfg.DeliverPolicy),
-		AckPolicy:      jetstream.AckAllPolicy,
+		Name:           wCfg.Name,
+		Durable:        wCfg.Name,
+		DeliverPolicy:  deliverPolicy,
+		AckPolicy:      ackPolicy,
 		MemoryStorage:  true,
-		FilterSubjects: n.Cfg.Subjects,
+		FilterSubjects: wCfg.Subjects,
+		MaxAckPending:  *wCfg.MaxAckPending,
 	})
 	if err != nil {
-		return fmt.Errorf("failed to create consumer: %v", err)
+		return fmt.Errorf("create consumer: %w", err)
 	}
 
 	for {
@@ -197,12 +411,14 @@ func (n *JetstreamInput) workerStart(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		default:
-			mb, err := c.FetchNoWait(n.Cfg.FetchBatchSize)
+			// load current config for dynamic fields like Format
+			cfg := n.cfg.Load()
+			mb, err := c.FetchNoWait(cfg.FetchBatchSize)
 			if err != nil {
-				return fmt.Errorf("failed to fetch messages: %v", err)
+				return fmt.Errorf("fetch messages: %w", err)
 			}
 			for m := range mb.Messages() {
-				n.msgHandler(m)
+				n.msgHandler(ctx, cfg, m)
 			}
 			if mb.Error() != nil {
 				return err
@@ -211,61 +427,85 @@ func (n *JetstreamInput) workerStart(ctx context.Context) error {
 	}
 }
 
-func (n *JetstreamInput) msgHandler(msg jetstream.Msg) {
+func (n *jetstreamInput) msgHandler(ctx context.Context, cfg *config, msg jetstream.Msg) {
 	msg.Ack()
-	if n.Cfg.Debug {
+	if cfg.Debug {
 		n.logger.Printf("received msg, subject=%s, len=%d, data=%s", msg.Subject(), len(msg.Data()), msg.Data())
 	}
 
-	switch n.Cfg.Format {
+	dc := n.dynCfg.Load()
+	switch cfg.Format {
 	case "event":
 		evMsgs := make([]*formatters.EventMsg, 1)
 		err := json.Unmarshal(msg.Data(), &evMsgs)
 		if err != nil {
-			if n.Cfg.Debug {
+			if cfg.Debug {
 				n.logger.Printf("failed to unmarshal event msg: %v", err)
 			}
 			return
 		}
 
-		for _, p := range n.evps {
+		for _, p := range dc.evps {
 			evMsgs = p.Apply(evMsgs...)
 		}
 
-		go func() {
-			for _, o := range n.outputs {
-				for _, ev := range evMsgs {
-					o.WriteEvent(n.ctx, ev)
-				}
+		if n.pipeline != nil {
+			select {
+			case <-ctx.Done():
+				return
+			case n.pipeline <- &pipeline.Msg{
+				Events:  evMsgs,
+				Outputs: dc.outputsMap,
+			}:
+			default:
+				n.logger.Printf("pipeline channel is full, dropping event")
 			}
-		}()
+		}
+		for _, o := range n.outputs {
+			for _, ev := range evMsgs {
+				o.WriteEvent(ctx, ev)
+			}
+		}
+
 	case "proto":
 		var protoMsg = &gnmi.SubscribeResponse{}
 		err := proto.Unmarshal(msg.Data(), protoMsg)
 		if err != nil {
-			if n.Cfg.Debug {
+			if cfg.Debug {
 				n.logger.Printf("failed to unmarshal proto msg: %v", err)
 			}
 			return
 		}
+		meta := n.getMetaFromSubject(msg.Subject(), cfg)
 
-		go func() {
-			for _, o := range n.outputs {
-				o.Write(n.ctx, protoMsg, n.getMetaFromSubject(msg.Subject()))
+		if n.pipeline != nil {
+			select {
+			case <-ctx.Done():
+				return
+			case n.pipeline <- &pipeline.Msg{
+				Msg:     protoMsg,
+				Meta:    meta,
+				Outputs: dc.outputsMap,
+			}:
+			default:
+				n.logger.Printf("pipeline channel is full, dropping message")
 			}
-		}()
+		}
+		for _, o := range n.outputs {
+			o.Write(ctx, protoMsg, meta)
+		}
 	default:
-		n.logger.Printf("unsupported format: %s", n.Cfg.Format)
+		n.logger.Printf("unsupported format: %s", cfg.Format)
 	}
 }
 
-func (n *JetstreamInput) getMetaFromSubject(subject string) outputs.Meta {
+func (n *jetstreamInput) getMetaFromSubject(subject string, wCfg *config) outputs.Meta {
 	meta := outputs.Meta{}
 	subjectSections := strings.SplitN(subject, ".", 3)
 	if len(subjectSections) < 3 {
 		return meta
 	}
-	switch n.Cfg.SubjectFormat {
+	switch wCfg.SubjectFormat {
 	case subjectFormat_Static:
 	case subjectFormat_SubTarget:
 		meta["subscription-name"] = subjectSections[1]
@@ -279,14 +519,18 @@ func (n *JetstreamInput) getMetaFromSubject(subject string) outputs.Meta {
 }
 
 // Close //
-func (n *JetstreamInput) Close() error {
-	n.cfn()
-	n.wg.Wait()
+func (n *jetstreamInput) Close() error {
+	if n.cfn != nil {
+		n.cfn()
+	}
+	if n.wg != nil {
+		n.wg.Wait()
+	}
 	return nil
 }
 
 // SetLogger //
-func (n *JetstreamInput) SetLogger(logger *log.Logger) {
+func (n *jetstreamInput) setLogger(logger *log.Logger) {
 	if logger != nil && n.logger != nil {
 		n.logger.SetOutput(logger.Writer())
 		n.logger.SetFlags(logger.Flags())
@@ -294,87 +538,97 @@ func (n *JetstreamInput) SetLogger(logger *log.Logger) {
 }
 
 // SetOutputs //
-func (n *JetstreamInput) SetOutputs(outs map[string]outputs.Output) {
-	if len(n.Cfg.Outputs) == 0 {
+func (n *jetstreamInput) getOutputs(outs map[string]outputs.Output, cfg *config) ([]outputs.Output, map[string]struct{}) {
+	outputs := make([]outputs.Output, 0)
+
+	if len(cfg.Outputs) == 0 {
 		for _, o := range outs {
-			n.outputs = append(n.outputs, o)
+			outputs = append(outputs, o)
 		}
-		return
+		return outputs, nil
 	}
-	for _, name := range n.Cfg.Outputs {
-		if o, ok := outs[name]; ok {
-			n.outputs = append(n.outputs, o)
+	outputsMap := make(map[string]struct{})
+	for _, name := range cfg.Outputs {
+		outputsMap[name] = struct{}{} // for collector
+		if o, ok := outs[name]; ok {  // for subscribe
+			outputs = append(outputs, o)
 		}
 	}
+	return outputs, outputsMap
 }
 
-func (n *JetstreamInput) SetName(name string) {
+func (n *jetstreamInput) setName(name string, cfg *config) {
 	sb := strings.Builder{}
 	if name != "" {
 		sb.WriteString(name)
 		sb.WriteString("-")
 	}
-	sb.WriteString(n.Cfg.Name)
-	sb.WriteString("-jetsream-consumer")
-	n.Cfg.Name = sb.String()
+	sb.WriteString(cfg.Name)
+	sb.WriteString("-jetstream-consumer")
+	cfg.Name = sb.String()
 }
 
-func (n *JetstreamInput) SetEventProcessors(ps map[string]map[string]any, logger *log.Logger, tcs map[string]*types.TargetConfig, acts map[string]map[string]any) error {
-	var err error
-	n.evps, err = formatters.MakeEventProcessors(
+func (n *jetstreamInput) buildEventProcessors(logger *log.Logger, eventProcessors []string) ([]formatters.EventProcessor, error) {
+	tcs, ps, acts, err := pkgutils.GetConfigMaps(n.store)
+	if err != nil {
+		return nil, err
+	}
+	return formatters.MakeEventProcessors(
 		logger,
-		n.Cfg.EventProcessors,
+		eventProcessors,
 		ps,
 		tcs,
 		acts,
 	)
-	if err != nil {
-		return err
-	}
-	return nil
 }
 
 // helper functions
 
-func (n *JetstreamInput) setDefaults() error {
-	if n.Cfg.Format == "" {
-		n.Cfg.Format = defaultFormat
+func (n *jetstreamInput) setDefaultsFor(cfg *config) error {
+	if cfg.Format == "" {
+		cfg.Format = defaultFormat
 	}
-	if !(strings.ToLower(n.Cfg.Format) == "event" || strings.ToLower(n.Cfg.Format) == "proto") {
+	if !(strings.ToLower(cfg.Format) == "event" || strings.ToLower(cfg.Format) == "proto") {
 		return fmt.Errorf("unsupported input format")
 	}
-	if n.Cfg.Name == "" {
-		n.Cfg.Name = "gnmic-jetstream-consumer" + uuid.New().String()
+	cfg.Format = strings.ToLower(cfg.Format)
+	if cfg.Name == "" {
+		cfg.Name = "gnmic-jetstream-consumer" + uuid.New().String()
 	}
-	if n.Cfg.DeliverPolicy == "" {
-		n.Cfg.DeliverPolicy = deliverPolicyAll
+	if cfg.DeliverPolicy == "" {
+		cfg.DeliverPolicy = deliverPolicyAll
 	}
-	if n.Cfg.SubjectFormat == "" {
-		n.Cfg.SubjectFormat = subjectFormat_Static
+	if cfg.SubjectFormat == "" {
+		cfg.SubjectFormat = subjectFormat_Static
 	}
-	if n.Cfg.Address == "" {
-		n.Cfg.Address = defaultAddress
+
+	if cfg.Address == "" {
+		cfg.Address = defaultAddress
 	}
-	if n.Cfg.ConnectTimeWait <= 0 {
-		n.Cfg.ConnectTimeWait = natsConnectWait
+	if cfg.ConnectTimeWait <= 0 {
+		cfg.ConnectTimeWait = natsConnectWait
 	}
-	if n.Cfg.NumWorkers <= 0 {
-		n.Cfg.NumWorkers = defaultNumWorkers
+	if cfg.NumWorkers <= 0 {
+		cfg.NumWorkers = defaultNumWorkers
 	}
-	if n.Cfg.BufferSize <= 0 {
-		n.Cfg.BufferSize = defaultBufferSize
+	if cfg.BufferSize <= 0 {
+		cfg.BufferSize = defaultBufferSize
 	}
-	if n.Cfg.FetchBatchSize <= 0 {
-		n.Cfg.FetchBatchSize = defaultFetchBatchSize
+	if cfg.FetchBatchSize <= 0 {
+		cfg.FetchBatchSize = defaultFetchBatchSize
+	}
+	if cfg.MaxAckPending == nil || *cfg.MaxAckPending <= -2 {
+		v := defaultMaxAckPending
+		cfg.MaxAckPending = &v
 	}
 	return nil
 }
 
-func (n *JetstreamInput) createNATSConn(c *Config) (*nats.Conn, error) {
+func (n *jetstreamInput) createNATSConn(c *config) (*nats.Conn, error) {
 	opts := []nats.Option{
 		nats.Name(c.Name),
 		nats.SetCustomDialer(n),
-		nats.ReconnectWait(n.Cfg.ConnectTimeWait),
+		nats.ReconnectWait(c.ConnectTimeWait),
 		nats.ReconnectBufSize(natsReconnectBufferSize),
 		nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, err error) {
 			n.logger.Printf("NATS error: %v", err)
@@ -389,9 +643,9 @@ func (n *JetstreamInput) createNATSConn(c *Config) (*nats.Conn, error) {
 	if c.Username != "" && c.Password != "" {
 		opts = append(opts, nats.UserInfo(c.Username, c.Password))
 	}
-	if n.Cfg.TLS != nil {
+	if c.TLS != nil {
 		tlsConfig, err := utils.NewTLSConfig(
-			n.Cfg.TLS.CaFile, n.Cfg.TLS.CertFile, n.Cfg.TLS.KeyFile, "", n.Cfg.TLS.SkipVerify,
+			c.TLS.CaFile, c.TLS.CertFile, c.TLS.KeyFile, "", c.TLS.SkipVerify,
 			false)
 		if err != nil {
 			return nil, err
@@ -408,7 +662,7 @@ func (n *JetstreamInput) createNATSConn(c *Config) (*nats.Conn, error) {
 }
 
 // Dial //
-func (n *JetstreamInput) Dial(network, address string) (net.Conn, error) {
+func (n *jetstreamInput) Dial(network, address string) (net.Conn, error) {
 	ctx, cancel := context.WithCancel(n.ctx)
 	defer cancel()
 
@@ -417,20 +671,17 @@ func (n *JetstreamInput) Dial(network, address string) (net.Conn, error) {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-
+		cfg := n.cfg.Load()
 		select {
 		case <-n.ctx.Done():
 			return nil, n.ctx.Err()
 		default:
 			d := &net.Dialer{}
-			conn, err := d.DialContext(ctx, network, address)
-			if err != nil {
-				n.logger.Printf("failed to connect to NATS server %s: %v", address, err)
-				time.Sleep(n.Cfg.ConnectTimeWait)
-				continue
+			if conn, err := d.DialContext(ctx, network, address); err == nil {
+				n.logger.Printf("successfully connected to NATS server %s", address)
+				return conn, nil
 			}
-			n.logger.Printf("successfully connected to NATS server %s", address)
-			return conn, nil
+			time.Sleep(cfg.ConnectTimeWait)
 		}
 	}
 }

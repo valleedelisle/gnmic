@@ -39,6 +39,8 @@ const (
 
 // trigger triggers an action when certain conditions are met
 type trigger struct {
+	formatters.BaseProcessor
+
 	Condition      string                 `mapstructure:"condition,omitempty"`
 	MinOccurrences int                    `mapstructure:"min-occurrences,omitempty"`
 	MaxOccurrences int                    `mapstructure:"max-occurrences,omitempty"`
@@ -148,9 +150,6 @@ func (p *trigger) WithLogger(l *log.Logger) {
 }
 
 func (p *trigger) WithTargets(tcs map[string]*types.TargetConfig) {
-	if p.Debug {
-		p.logger.Printf("with targets: %+v", tcs)
-	}
 	p.targets = tcs
 }
 

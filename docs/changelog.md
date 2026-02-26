@@ -1,5 +1,59 @@
 ## Changelog
 
+### v0.44.0 - February 17th 2026
+
+- gNMI Extension:
+
+    - gNMI extension are not parsed and properly displayed given the corresponding Protobuf files
+
+- Collector mode:
+
+    - Collector mode now stores Targets state (gNMI connection and subscription(s) state) in a separate store.
+
+    - Collector mode supports an SSE endpoint streaming config and state for any object (Target, subscription, outputs, etc.)
+
+- Target
+
+   - Multiple gRPC level config knobs can now be set per target: gRPC read/write buffer, gRPC window size,...
+
+### v0.43.0 - February 1st 2026
+
+- Inputs:
+
+    - Jetstream:
+      - Added support for configuring `max-ack-pending` to limit the maximum number of unacknowledged messages on a NATS JetStream input.
+      - DeliverPolicy and AckPolicy are now fully configurable for greater flexibility and control.
+
+- Commands:
+
+    - Added the new `collector` command: Runs gNMIc in collector mode, enabling dynamic, live updates to all configuration objects including targets, subscriptions, outputs, inputs, and processors. Unlike the `subscribe` command, the `collector` command supports on-the-fly configuration changes via the REST API, without requiring a restart. gNMIc automatically reconciles changes to maintain the desired state.
+
+    - The `collector` command also includes a suite of subcommands, allowing you to configure the gNMIc collector directly from the CLI.
+
+- Outputs:
+
+    - Introduced support for OpenTelemetry as an output destination, enabling seamless integration with observability platforms.
+
+
+### v0.42.0 - September 19th 2025
+
+- Inputs:
+
+    - Add support for NATS Jetstream input type.
+
+- Loader:
+
+    - Loaded targets subscribe requests are now subject the `subscribe-backoff` timer.
+    - Loaded target configuration now supports ENV variables when `expand-env` is set to true.
+
+- gNMI server:
+
+    - The unary RPCs timeout is now configurable.
+
+- Targets:
+
+    - A new internal prometheus metric was added `gnmic_target_connection_state`. It reflect the gRPC client connection state with values: 0(UNKNOWN), 1 (IDLE), 2 (CONNECTING), 3 (READY), 4 (TRANSIENT_FAILURE), or 5 (SHUTDOWN).
+    
 ### v0.41.0 - April 6th 2025
 
 - Processors:

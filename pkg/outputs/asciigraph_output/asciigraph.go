@@ -35,6 +35,8 @@ import (
 	"github.com/openconfig/gnmic/pkg/formatters"
 	"github.com/openconfig/gnmic/pkg/gtemplate"
 	"github.com/openconfig/gnmic/pkg/outputs"
+	gutils "github.com/openconfig/gnmic/pkg/utils"
+	"github.com/zestor-dev/zestor/store"
 )
 
 const (
@@ -65,6 +67,7 @@ func init() {
 
 // asciigraphOutput //
 type asciigraphOutput struct {
+	outputs.BaseOutput
 	cfg     *cfg
 	logger  *log.Logger
 	eventCh chan *formatters.EventMsg
@@ -80,6 +83,7 @@ type asciigraphOutput struct {
 	evps         []formatters.EventProcessor
 
 	targetTpl *template.Template
+	store     store.Store[any]
 }
 
 type series struct {
@@ -130,11 +134,11 @@ func (a *asciigraphOutput) String() string {
 	return string(b)
 }
 
-func (a *asciigraphOutput) SetEventProcessors(ps map[string]map[string]interface{},
-	logger *log.Logger,
-	tcs map[string]*types.TargetConfig,
-	acts map[string]map[string]interface{}) error {
-	var err error
+func (a *asciigraphOutput) setEventProcessors(logger *log.Logger) error {
+	tcs, ps, acts, err := gutils.GetConfigMaps(a.store)
+	if err != nil {
+		return err
+	}
 	a.evps, err = formatters.MakeEventProcessors(
 		logger,
 		a.cfg.EventProcessors,
@@ -148,7 +152,7 @@ func (a *asciigraphOutput) SetEventProcessors(ps map[string]map[string]interface
 	return nil
 }
 
-func (a *asciigraphOutput) SetLogger(logger *log.Logger) {
+func (a *asciigraphOutput) setLogger(logger *log.Logger) {
 	if logger != nil && a.logger != nil {
 		a.logger.SetOutput(logger.Writer())
 		a.logger.SetFlags(logger.Flags())
@@ -164,12 +168,20 @@ func (a *asciigraphOutput) Init(ctx context.Context, name string, cfg map[string
 
 	a.logger.SetPrefix(fmt.Sprintf(loggingPrefix, name))
 
+	options := &outputs.OutputOptions{}
 	for _, opt := range opts {
-		if err := opt(a); err != nil {
+		if err := opt(options); err != nil {
 			return err
 		}
 	}
+	a.store = options.Store
 
+	a.setLogger(options.Logger)
+
+	err = a.setEventProcessors(options.Logger)
+	if err != nil {
+		return err
+	}
 	if a.cfg.TargetTemplate == "" {
 		a.targetTpl = outputs.DefaultTargetTemplate
 	} else if a.cfg.AddTarget != "" {
@@ -188,6 +200,10 @@ func (a *asciigraphOutput) Init(ctx context.Context, name string, cfg map[string
 	go a.graph(ctx)
 	a.logger.Printf("initialized asciigraph output: %s", a.String())
 	return nil
+}
+
+func (a *asciigraphOutput) Update(ctx context.Context, cfg map[string]any) error {
+	return errors.New("not implemented for this output type")
 }
 
 func (a *asciigraphOutput) setDefaults() error {
@@ -431,8 +447,18 @@ func splitEvent(e *formatters.EventMsg) []*formatters.EventMsg {
 	return evs
 }
 
+var stringBuilderPool = sync.Pool{
+	New: func() any {
+		return new(strings.Builder)
+	},
+}
+
 func (a *asciigraphOutput) buildSeriesName(e *formatters.EventMsg) string {
-	sb := &strings.Builder{}
+	sb := stringBuilderPool.Get().(*strings.Builder)
+	defer func() {
+		sb.Reset()
+		stringBuilderPool.Put(sb)
+	}()
 	sb.WriteString(e.Name)
 	sb.WriteString(":")
 	for k := range e.Values {
